@@ -15,7 +15,10 @@ import type {
   OAuthCredentials,
   OAuthLoginCallbacks,
 } from "@mariozechner/pi-ai";
-import type { ExtensionAPI, ProviderModelConfig } from "@mariozechner/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ProviderModelConfig,
+} from "@mariozechner/pi-coding-agent";
 import { visibleWidth } from "@mariozechner/pi-tui";
 
 // =============================================================================
@@ -203,7 +206,7 @@ async function refreshKiloToken(
 // Dynamic Model Loading
 // =============================================================================
 
-interface OpenRouterModel {
+interface KiloModel {
   id: string;
   name: string;
   context_length: number;
@@ -220,6 +223,8 @@ interface OpenRouterModel {
   };
   top_provider?: { max_completion_tokens?: number | null };
   supported_parameters?: string[];
+  preferredIndex?: number;
+  isFree?: boolean;
 }
 
 function parsePrice(price: string | null | undefined): number {
@@ -230,21 +235,14 @@ function parsePrice(price: string | null | undefined): number {
   return parsed * 1_000_000;
 }
 
-function isFreeModel(m: OpenRouterModel): boolean {
+function isFreeModel(m: KiloModel): boolean {
   const prompt = parseFloat(m.pricing?.prompt ?? "1");
   const completion = parseFloat(m.pricing?.completion ?? "1");
   if (prompt !== 0 || completion !== 0) return false;
-  // Zero pricing alone isn't reliable (some models report "0" but require auth).
-  // Use the :free suffix (OpenRouter convention), Kilo-native models (no vendor
-  // prefix), or known Kilo/OpenRouter free routers.
-  if (m.id === "kilo-auto/free") return true;
-  if (m.id.includes(":free")) return true;
-  if (!m.id.includes("/")) return true;
-  if (m.id.startsWith("kilo/") || m.id.startsWith("openrouter/")) return true;
-  return false;
+  return !!m.isFree;
 }
 
-function mapOpenRouterModel(m: OpenRouterModel): ProviderModelConfig {
+function mapOpenRouterModel(m: KiloModel): ProviderModelConfig {
   const inputModalities = m.architecture?.input_modalities ?? ["text"];
   const supportsImages = inputModalities.includes("image");
   const supportsReasoning =
@@ -293,7 +291,7 @@ async function fetchKiloModels(options?: {
     );
   }
 
-  const json = (await response.json()) as { data?: OpenRouterModel[] };
+  const json = (await response.json()) as { data?: KiloModel[] };
   if (!json.data || !Array.isArray(json.data)) {
     throw new Error("Invalid models response: missing data array");
   }
@@ -307,6 +305,7 @@ async function fetchKiloModels(options?: {
       if (options?.freeOnly && !isFreeModel(m)) return false;
       return true;
     })
+    .sort((a, b) => (a.preferredIndex || Infinity) - (b.preferredIndex || Infinity))
     .map(mapOpenRouterModel);
 }
 
@@ -540,7 +539,10 @@ export default async function (pi: ExtensionAPI) {
           let totalCacheWrite = 0;
           let totalCost = 0;
           for (const entry of ctx.sessionManager.getEntries()) {
-            if (entry.type === "message" && entry.message.role === "assistant") {
+            if (
+              entry.type === "message" &&
+              entry.message.role === "assistant"
+            ) {
               totalInput += entry.message.usage.input;
               totalOutput += entry.message.usage.output;
               totalCacheRead += entry.message.usage.cacheRead;
@@ -551,9 +553,13 @@ export default async function (pi: ExtensionAPI) {
 
           // Match built-in context usage behavior
           const contextUsage = ctx.getContextUsage();
-          const contextWindow = contextUsage?.contextWindow ?? model?.contextWindow ?? 0;
+          const contextWindow =
+            contextUsage?.contextWindow ?? model?.contextWindow ?? 0;
           const contextPercentValue = contextUsage?.percent ?? 0;
-          const contextPercent = contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";
+          const contextPercent =
+            contextUsage?.percent !== null
+              ? contextPercentValue.toFixed(1)
+              : "?";
 
           // Build pwd line like built-in (path + branch + session name)
           let pwd = process.cwd();
@@ -576,12 +582,18 @@ export default async function (pi: ExtensionAPI) {
           const statsParts: string[] = [];
           if (totalInput) statsParts.push(`↑${formatTokens(totalInput)}`);
           if (totalOutput) statsParts.push(`↓${formatTokens(totalOutput)}`);
-          if (totalCacheRead) statsParts.push(`R${formatTokens(totalCacheRead)}`);
-          if (totalCacheWrite) statsParts.push(`W${formatTokens(totalCacheWrite)}`);
+          if (totalCacheRead)
+            statsParts.push(`R${formatTokens(totalCacheRead)}`);
+          if (totalCacheWrite)
+            statsParts.push(`W${formatTokens(totalCacheWrite)}`);
 
-          const usingSubscription = model ? ctx.modelRegistry.isUsingOAuth(model) : false;
+          const usingSubscription = model
+            ? ctx.modelRegistry.isUsingOAuth(model)
+            : false;
           if (totalCost || usingSubscription) {
-            statsParts.push(`$${totalCost.toFixed(3)}${usingSubscription ? " (sub)" : ""}`);
+            statsParts.push(
+              `$${totalCost.toFixed(3)}${usingSubscription ? " (sub)" : ""}`,
+            );
           }
 
           const autoIndicator = " (auto)";
@@ -601,7 +613,9 @@ export default async function (pi: ExtensionAPI) {
           statsParts.push(contextPercentStr);
 
           // Inject credits inline on the main stats line
-          const creditsStatus = footerData.getExtensionStatuses().get("kilo-credits");
+          const creditsStatus = footerData
+            .getExtensionStatuses()
+            .get("kilo-credits");
           if (creditsStatus) statsParts.push(creditsStatus);
 
           let statsLeft = statsParts.join(" ");
@@ -613,7 +627,9 @@ export default async function (pi: ExtensionAPI) {
           if (model?.reasoning) {
             const thinkingLevel = pi.getThinkingLevel() || "off";
             rightSideWithoutProvider =
-              thinkingLevel === "off" ? `${modelName} • thinking off` : `${modelName} • ${thinkingLevel}`;
+              thinkingLevel === "off"
+                ? `${modelName} • thinking off`
+                : `${modelName} • ${thinkingLevel}`;
           }
 
           let rightSide = rightSideWithoutProvider;
@@ -642,7 +658,9 @@ export default async function (pi: ExtensionAPI) {
             if (availableForRight > 3) {
               const plainRight = rightSide.replace(/\x1b\[[0-9;]*m/g, "");
               const truncatedRight = plainRight.substring(0, availableForRight);
-              const padding = " ".repeat(width - statsLeftWidth - truncatedRight.length);
+              const padding = " ".repeat(
+                width - statsLeftWidth - truncatedRight.length,
+              );
               statsLine = statsLeft + padding + truncatedRight;
             } else {
               statsLine = statsLeft;
