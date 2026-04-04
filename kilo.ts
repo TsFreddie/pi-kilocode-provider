@@ -10,8 +10,6 @@
  */
 
 import type {
-  Api,
-  Model,
   OAuthCredentials,
   OAuthLoginCallbacks,
 } from "@mariozechner/pi-ai";
@@ -235,13 +233,6 @@ function parsePrice(price: string | null | undefined): number {
   return parsed * 1_000_000;
 }
 
-function isFreeModel(m: KiloModel): boolean {
-  const prompt = parseFloat(m.pricing?.prompt ?? "1");
-  const completion = parseFloat(m.pricing?.completion ?? "1");
-  if (prompt !== 0 || completion !== 0) return false;
-  return !!m.isFree;
-}
-
 function mapOpenRouterModel(m: KiloModel): ProviderModelConfig {
   const inputModalities = m.architecture?.input_modalities ?? ["text"];
   const supportsImages = inputModalities.includes("image");
@@ -268,17 +259,69 @@ function mapOpenRouterModel(m: KiloModel): ProviderModelConfig {
   };
 }
 
-async function fetchKiloModels(options?: {
-  token?: string;
-  freeOnly?: boolean;
-}): Promise<ProviderModelConfig[]> {
+// States
+let modelList: ProviderModelConfig[] = [];
+let modelUpdated = false;
+
+const MODELS_CACHE_FILE = `pi-kilo-models-cache.json`;
+
+async function saveModelsToCache(models: KiloModel[], free: boolean) {
+  try {
+    const { writeFileSync } = await import("fs");
+    const { tmpdir } = await import("os");
+    const { join } = await import("path");
+    const cachePath = join(tmpdir(), MODELS_CACHE_FILE);
+    writeFileSync(cachePath, JSON.stringify({ models, free }), "utf-8");
+  } catch (error) {
+    console.warn(
+      "[kilo] Failed to save models cache:",
+      error instanceof Error ? error.message : error,
+    );
+  }
+}
+
+async function loadModelsFromCache(): Promise<{
+  models: KiloModel[];
+  free: boolean;
+} | null> {
+  try {
+    const { readFileSync, existsSync } = await import("fs");
+    const { tmpdir } = await import("os");
+    const { join } = await import("path");
+    const cachePath = join(tmpdir(), MODELS_CACHE_FILE);
+    if (!existsSync(cachePath)) return null;
+    const data = readFileSync(cachePath, "utf-8");
+    const parsed = JSON.parse(data);
+    if (!parsed || !Array.isArray(parsed.models)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function updateModels(models: KiloModel[], free: boolean) {
+  modelList.length = 0;
+  modelList.push(
+    ...models
+      .filter((m) => {
+        const outputMods = m.architecture?.output_modalities ?? [];
+        if (outputMods.includes("image")) return false;
+        if (free && !m.isFree) return false;
+        return true;
+      })
+      .sort(
+        (a, b) =>
+          (a.preferredIndex || Infinity) - (b.preferredIndex || Infinity),
+      )
+      .map(mapOpenRouterModel),
+  );
+}
+
+async function updateKiloModels(free: boolean) {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "User-Agent": "pi-kilo-provider",
   };
-  if (options?.token) {
-    headers.Authorization = `Bearer ${options.token}`;
-  }
 
   const response = await fetch(`${KILO_GATEWAY_BASE}/models`, {
     headers,
@@ -296,17 +339,9 @@ async function fetchKiloModels(options?: {
     throw new Error("Invalid models response: missing data array");
   }
 
-  return json.data
-    .filter((m) => {
-      // Skip image generation models
-      const outputMods = m.architecture?.output_modalities ?? [];
-      if (outputMods.includes("image")) return false;
-      // When unauthenticated, only show free models
-      if (options?.freeOnly && !isFreeModel(m)) return false;
-      return true;
-    })
-    .sort((a, b) => (a.preferredIndex || Infinity) - (b.preferredIndex || Infinity))
-    .map(mapOpenRouterModel);
+  await saveModelsToCache(json.data, free);
+  updateModels(json.data, free);
+  modelUpdated = true;
 }
 
 // =============================================================================
@@ -328,33 +363,32 @@ const KILO_PROVIDER_CONFIG = {
 // =============================================================================
 
 export default async function (pi: ExtensionAPI) {
-  // Fetch free models at load time so the provider is immediately usable.
-  let freeModels: ProviderModelConfig[] = [];
-  try {
-    freeModels = await fetchKiloModels({ freeOnly: true });
-  } catch (error) {
-    console.warn(
-      "[kilo] Failed to fetch free models at startup:",
-      error instanceof Error ? error.message : error,
-    );
+  const loaded = await loadModelsFromCache();
+  if (!loaded) {
+    try {
+      await updateKiloModels(true);
+    } catch (error) {
+      console.warn(
+        "[kilo] Failed to fetch initial models:",
+        error instanceof Error ? error.message : error,
+      );
+    }
+  } else {
+    updateModels(loaded.models, loaded.free);
   }
 
-  // Full model list cached after login or session_start (when already logged in).
-  // Used by modifyModels to upgrade the free list without an async fetch.
-  let cachedAllModels: ProviderModelConfig[] = [];
-
-  function makeOAuthConfig() {
-    return {
+  pi.registerProvider("kilo", {
+    ...KILO_PROVIDER_CONFIG,
+    models: modelList,
+    oauth: {
       name: "Kilo",
       login: async (callbacks: OAuthLoginCallbacks) => {
         const cred = await loginKilo(callbacks);
-        // Cache full models so modifyModels can use them during the
-        // modelRegistry.refresh() that runs right after login returns.
         try {
-          cachedAllModels = await fetchKiloModels({ token: cred.access });
+          await updateKiloModels(!cred?.access);
         } catch (error) {
           console.warn(
-            "[kilo] Failed to fetch models after login:",
+            "[kilo] Failed to fetch models on session start:",
             error instanceof Error ? error.message : error,
           );
         }
@@ -362,36 +396,7 @@ export default async function (pi: ExtensionAPI) {
       },
       refreshToken: refreshKiloToken,
       getApiKey: (cred: OAuthCredentials) => cred.access,
-      // Called by modelRegistry.refresh() when credentials exist.
-      // After logout, credentials are removed so this won't be called,
-      // leaving only the free models from config.models.
-      modifyModels: (models: Model<Api>[], _cred: OAuthCredentials) => {
-        if (cachedAllModels.length === 0) return models;
-        // Use an existing kilo model as a template for provider metadata
-        const template = models.find((m) => m.provider === "kilo");
-        if (!template) return models;
-        const nonKilo = models.filter((m) => m.provider !== "kilo");
-        const fullModels = cachedAllModels.map((m) => ({
-          ...template,
-          id: m.id,
-          name: m.name,
-          reasoning: m.reasoning,
-          input: m.input,
-          cost: m.cost,
-          contextWindow: m.contextWindow,
-          maxTokens: m.maxTokens,
-        }));
-        return [...nonKilo, ...fullModels];
-      },
-    };
-  }
-
-  // Always register with free models. modifyModels upgrades to full list
-  // when credentials exist, and naturally falls back after logout.
-  pi.registerProvider("kilo", {
-    ...KILO_PROVIDER_CONFIG,
-    models: freeModels,
-    oauth: makeOAuthConfig(),
+    },
   });
 
   // After session starts, pre-fetch all models if already logged in so
@@ -399,38 +404,42 @@ export default async function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     const cred = ctx.modelRegistry.authStorage.get("kilo");
 
-    // Clear credits if not logged in
-    if (cred?.type !== "oauth") {
+    // Clear credits if not logged in or not using Kilo models
+    if (cred?.type !== "oauth" || ctx.model?.provider !== "kilo") {
       ctx.ui.setStatus("kilo-credits", undefined);
       return;
     }
 
-    try {
-      cachedAllModels = await fetchKiloModels({ token: cred.access });
-    } catch (error) {
-      console.warn(
-        "[kilo] Failed to fetch models at session start:",
-        error instanceof Error ? error.message : error,
-      );
-      return;
-    }
-    if (cachedAllModels.length > 0) {
-      // Re-register to trigger modifyModels with the cached data.
-      ctx.modelRegistry.registerProvider("kilo", {
-        ...KILO_PROVIDER_CONFIG,
-        models: freeModels,
-        oauth: makeOAuthConfig(),
-      });
+    // Only fetch models if we haven't already done so
+    if (!modelUpdated) {
+      try {
+        await updateKiloModels(!cred);
+      } catch (error) {
+        console.warn(
+          "[kilo] Failed to fetch models on session start:",
+          error instanceof Error ? error.message : error,
+        );
+      }
+      ctx.modelRegistry.refresh();
+      // Update current model in case any capabilities are changed
+      // this is most likely happen to router models (e.g. kilo-auto)
+      const currentModel = ctx.model;
+      if (currentModel) {
+        if (currentModel.provider !== "kilo") return;
+        const model = ctx.modelRegistry.find("kilo", currentModel.id);
+        if (model) {
+          Object.assign(currentModel, model);
+        }
+      }
     }
 
     // Fetch and display credits balance
     try {
       const balance = await fetchKiloBalance(cred.access);
       if (balance !== null) {
-        const theme = ctx.ui.theme;
         ctx.ui.setStatus(
           "kilo-credits",
-          theme.fg("accent", `💰 ${formatCredits(balance)}`),
+          ctx.ui.theme.fg("accent", `💰 ${formatCredits(balance)}`),
         );
       }
     } catch (error) {
@@ -451,10 +460,9 @@ export default async function (pi: ExtensionAPI) {
     try {
       const balance = await fetchKiloBalance(cred.access);
       if (balance !== null) {
-        const theme = ctx.ui.theme;
         ctx.ui.setStatus(
           "kilo-credits",
-          theme.fg("accent", `💰 ${formatCredits(balance)}`),
+          ctx.ui.theme.fg("accent", `💰 ${formatCredits(balance)}`),
         );
       }
     } catch (error) {
@@ -473,10 +481,9 @@ export default async function (pi: ExtensionAPI) {
     try {
       const balance = await fetchKiloBalance(cred.access);
       if (balance !== null) {
-        const theme = ctx.ui.theme;
         ctx.ui.setStatus(
           "kilo-credits",
-          theme.fg("accent", `💰 ${formatCredits(balance)}`),
+          ctx.ui.theme.fg("accent", `💰 ${formatCredits(balance)}`),
         );
       }
     } catch (error) {
@@ -506,7 +513,7 @@ export default async function (pi: ExtensionAPI) {
       message: {
         customType: "kilo",
         content: `By using Kilo, you agree to the Terms of Service: ${KILO_TOS_URL}`,
-        display: "inline",
+        display: true,
       },
     };
   });
