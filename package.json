@@ -1,5 +1,5 @@
 {
-  "name": "@mrexodia/kilo-pi-provider",
+  "name": "@tsfreddie/pi-kilocode-provider",
   "version": "1.2.0",
   "type": "module",
   "keywords": [
@@ -13,7 +13,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mrexodia/kilo-pi-provider.git"
+    "url": "git+https://github.com/TsFreddie/pi-kilocode-provider.git"
   },
   "devDependencies": {
     "@mariozechner/pi-ai": "^0.65.0",
