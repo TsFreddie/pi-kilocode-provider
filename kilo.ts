@@ -237,6 +237,7 @@ function isFreeModel(m: OpenRouterModel): boolean {
   // Zero pricing alone isn't reliable (some models report "0" but require auth).
   // Use the :free suffix (OpenRouter convention), Kilo-native models (no vendor
   // prefix), or known Kilo/OpenRouter free routers.
+  if (m.id === "kilo-auto/free") return true;
   if (m.id.includes(":free")) return true;
   if (!m.id.includes("/")) return true;
   if (m.id.startsWith("kilo/") || m.id.startsWith("openrouter/")) return true;
