@@ -16,9 +16,7 @@
     "url": "git+https://github.com/TsFreddie/pi-kilocode-provider.git"
   },
   "devDependencies": {
-    "@mariozechner/pi-ai": "^0.65.0",
     "@mariozechner/pi-coding-agent": "^0.65.0",
-    "@mariozechner/pi-tui": "^0.65.0",
-    "typescript": "^6.0.2"
+    "@mariozechner/pi-tui": "^0.65.0"
   }
 }

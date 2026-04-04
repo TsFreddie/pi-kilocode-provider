@@ -1,6 +1,8 @@
-# kilo-pi-provider
+# pi-kilocode-provider
 
 Kilo provider extension for Pi. Access 300+ AI models through the Kilo Gateway.
+
+forked from [mrexodia/kilo-pi-provider](https://github.com/mrexodia/kilo-pi-provider)
 
 ## Prerequisites
 
@@ -13,7 +15,7 @@ npm install -g @mariozechner/pi-coding-agent
 ## Installation
 
 ```bash
-pi install git:github.com/mrexodia/kilo-pi-provider
+pi install git:github.com/TsFreddie/pi-kilocode-provider
 ```
 
 ## Usage

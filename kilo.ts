@@ -10,11 +10,8 @@
  */
 
 import type {
-  OAuthCredentials,
-  OAuthLoginCallbacks,
-} from "@mariozechner/pi-ai";
-import type {
   ExtensionAPI,
+  OAuthCredential,
   ProviderModelConfig,
 } from "@mariozechner/pi-coding-agent";
 import { visibleWidth } from "@mariozechner/pi-tui";
@@ -26,11 +23,13 @@ import { visibleWidth } from "@mariozechner/pi-tui";
 const KILO_API_BASE = process.env.KILO_API_URL || "https://api.kilo.ai";
 const KILO_GATEWAY_BASE = `${KILO_API_BASE}/api/gateway`;
 const KILO_DEVICE_AUTH_ENDPOINT = `${KILO_API_BASE}/api/device-auth/codes`;
+const KILO_TOKEN_REFRESH_ENDPOINT = `${KILO_API_BASE}/auth/device/token`;
 const POLL_INTERVAL_MS = 3000;
 const MODELS_FETCH_TIMEOUT_MS = 10_000;
-const TOKEN_EXPIRATION_MS = 365 * 24 * 60 * 60 * 1000; // 1 year
 const KILO_TOS_URL = "https://kilo.ai/terms";
 const KILO_PROFILE_ENDPOINT = `${KILO_API_BASE}/api/profile`;
+
+const EAGER_REFRESH_THRESHOLD_MS = 5 * 60 * 1000;
 
 // =============================================================================
 // Balance Fetching
@@ -84,6 +83,12 @@ interface DeviceAuthPollResponse {
   userEmail?: string;
 }
 
+interface TokenRefreshResponse {
+  access_token: string;
+  refresh_token: string;
+  expires_in: number;
+}
+
 function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
@@ -100,6 +105,52 @@ function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
       { once: true },
     );
   });
+}
+
+function isTokenFresh(tokenExpiry: number | null, now: number): boolean {
+  return tokenExpiry != null && tokenExpiry > now + EAGER_REFRESH_THRESHOLD_MS;
+}
+
+const refreshPromises = new Map<string, Promise<OAuthCredential>>();
+
+async function refreshAccessToken(
+  currentCredentials: OAuthCredential,
+): Promise<OAuthCredential> {
+  const cacheKey = "kilo";
+  const cached = refreshPromises.get(cacheKey);
+  if (cached) return cached;
+
+  const promise = (async () => {
+    const response = await fetch(KILO_TOKEN_REFRESH_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        grant_type: "refresh_token",
+        refresh_token: currentCredentials.refresh,
+        client_id: "opencode-cli",
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Token refresh failed: ${response.status}`);
+    }
+
+    const data = (await response.json()) as TokenRefreshResponse;
+    const newCreds: OAuthCredential = {
+      type: "oauth",
+      access: data.access_token,
+      refresh: data.refresh_token,
+      expires: Date.now() + data.expires_in * 1000,
+    };
+    return newCreds;
+  })();
+
+  refreshPromises.set(cacheKey, promise);
+  try {
+    return await promise;
+  } finally {
+    refreshPromises.delete(cacheKey);
+  }
 }
 
 async function initiateDeviceAuth(): Promise<DeviceAuthResponse> {
@@ -134,70 +185,6 @@ async function pollDeviceAuth(code: string): Promise<DeviceAuthPollResponse> {
   }
 
   return (await response.json()) as DeviceAuthPollResponse;
-}
-
-async function loginKilo(
-  callbacks: OAuthLoginCallbacks,
-): Promise<OAuthCredentials> {
-  callbacks.onProgress?.("Initiating device authorization...");
-  const authData = await initiateDeviceAuth();
-  const { code, verificationUrl, expiresIn } = authData;
-
-  callbacks.onAuth({
-    url: verificationUrl,
-    instructions: `Enter code: ${code}`,
-  });
-
-  callbacks.onProgress?.("Waiting for browser authorization...");
-
-  const deadline = Date.now() + expiresIn * 1000;
-  while (Date.now() < deadline) {
-    if (callbacks.signal?.aborted) {
-      throw new Error("Login cancelled");
-    }
-
-    await abortableSleep(POLL_INTERVAL_MS, callbacks.signal);
-
-    const result = await pollDeviceAuth(code);
-
-    if (result.status === "approved") {
-      if (!result.token) {
-        throw new Error("Authorization approved but no token received");
-      }
-      callbacks.onProgress?.("Login successful!");
-      return {
-        refresh: result.token,
-        access: result.token,
-        expires: Date.now() + TOKEN_EXPIRATION_MS,
-      };
-    }
-
-    if (result.status === "denied") {
-      throw new Error("Authorization denied by user.");
-    }
-
-    if (result.status === "expired") {
-      throw new Error("Authorization code expired. Please try again.");
-    }
-
-    const remaining = Math.ceil((deadline - Date.now()) / 1000);
-    callbacks.onProgress?.(
-      `Waiting for browser authorization... (${remaining}s remaining)`,
-    );
-  }
-
-  throw new Error("Authentication timed out. Please try again.");
-}
-
-async function refreshKiloToken(
-  credentials: OAuthCredentials,
-): Promise<OAuthCredentials> {
-  if (credentials.expires > Date.now()) {
-    return credentials;
-  }
-  throw new Error(
-    "Kilo token expired. Please run /login kilo to re-authenticate.",
-  );
 }
 
 // =============================================================================
@@ -382,7 +369,63 @@ export default async function (pi: ExtensionAPI) {
     models: modelList,
     oauth: {
       name: "Kilo",
-      login: async (callbacks: OAuthLoginCallbacks) => {
+      login: async (callbacks) => {
+        async function loginKilo(
+          cb: typeof callbacks,
+        ): Promise<OAuthCredential> {
+          cb.onProgress?.("Initiating device authorization...");
+          const authData = await initiateDeviceAuth();
+          const { code, verificationUrl, expiresIn } = authData;
+
+          cb.onAuth({
+            url: verificationUrl,
+            instructions: `Enter code: ${code}`,
+          });
+
+          cb.onProgress?.("Waiting for browser authorization...");
+
+          const deadline = Date.now() + expiresIn * 1000;
+          while (Date.now() < deadline) {
+            if (cb.signal?.aborted) {
+              throw new Error("Login cancelled");
+            }
+
+            await abortableSleep(POLL_INTERVAL_MS, cb.signal);
+
+            const result = await pollDeviceAuth(code);
+
+            if (result.status === "approved") {
+              console.log(result);
+
+              if (!result.token) {
+                throw new Error("Authorization approved but no token received");
+              }
+              cb.onProgress?.("Login successful!");
+              return {
+                type: "oauth",
+                refresh: result.token,
+                access: result.token,
+                expires: Date.now() + 3600 * 1000,
+              };
+            }
+
+            if (result.status === "denied") {
+              throw new Error("Authorization denied by user.");
+            }
+
+            if (result.status === "expired") {
+              throw new Error("Authorization code expired. Please try again.");
+            }
+
+            const remaining = Math.ceil((deadline - Date.now()) / 1000);
+            cb.onProgress?.(
+              `Waiting for browser authorization... (${remaining}s remaining)`,
+            );
+          }
+
+          throw new Error("Authentication timed out. Please try again.");
+        }
+
         const cred = await loginKilo(callbacks);
         try {
           await updateKiloModels(!cred?.access);
@@ -394,8 +437,14 @@ export default async function (pi: ExtensionAPI) {
         }
         return cred;
       },
-      refreshToken: refreshKiloToken,
-      getApiKey: (cred: OAuthCredentials) => cred.access,
+      refreshToken: async (credentials: OAuthCredential) => {
+        if (isTokenFresh(credentials.expires, Date.now())) {
+          return credentials;
+        }
+        const newCreds = await refreshAccessToken(credentials);
+        return newCreds;
+      },
+      getApiKey: (cred) => cred.access,
     },
   });
 
