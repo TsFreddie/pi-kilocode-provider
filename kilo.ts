@@ -15,6 +15,7 @@ import type {
   ProviderModelConfig,
 } from "@mariozechner/pi-coding-agent";
 import { visibleWidth } from "@mariozechner/pi-tui";
+import { mkdirSync } from "fs";
 
 // =============================================================================
 // Constants
@@ -255,9 +256,11 @@ const MODELS_CACHE_FILE = `pi-kilo-models-cache.json`;
 async function saveModelsToCache(models: KiloModel[], free: boolean) {
   try {
     const { writeFileSync } = await import("fs");
-    const { tmpdir } = await import("os");
+    const { homedir } = await import("os");
     const { join } = await import("path");
-    const cachePath = join(tmpdir(), MODELS_CACHE_FILE);
+    const cacheDir = join(homedir(), ".cache", "pi");
+    mkdirSync(cacheDir, {recursive: true});
+    const cachePath = join(cacheDir, MODELS_CACHE_FILE);
     writeFileSync(cachePath, JSON.stringify({ models, free }), "utf-8");
   } catch (error) {
     console.warn(
@@ -273,9 +276,11 @@ async function loadModelsFromCache(): Promise<{
 } | null> {
   try {
     const { readFileSync, existsSync } = await import("fs");
-    const { tmpdir } = await import("os");
+    const { homedir } = await import("os");
     const { join } = await import("path");
-    const cachePath = join(tmpdir(), MODELS_CACHE_FILE);
+    const cacheDir = join(homedir(), ".cache", "pi");
+    mkdirSync(cacheDir, {recursive: true});
+    const cachePath = join(cacheDir, MODELS_CACHE_FILE);
     if (!existsSync(cachePath)) return null;
     const data = readFileSync(cachePath, "utf-8");
     const parsed = JSON.parse(data);
