@@ -244,6 +244,9 @@ function mapOpenRouterModel(m: KiloModel): ProviderModelConfig {
     },
     contextWindow: m.context_length,
     maxTokens: maxTokens,
+    compat: {
+      supportsDeveloperRole: false,
+    },
   };
 }
 
