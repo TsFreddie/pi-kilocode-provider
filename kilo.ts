@@ -24,8 +24,9 @@ import { mkdirSync } from "fs";
 const KILO_API_BASE = process.env.KILO_API_URL || "https://api.kilo.ai";
 const KILO_GATEWAY_BASE = `${KILO_API_BASE}/api/gateway`;
 const KILO_DEVICE_AUTH_ENDPOINT = `${KILO_API_BASE}/api/device-auth/codes`;
-const KILO_TOKEN_REFRESH_ENDPOINT = `${KILO_API_BASE}/auth/device/token`;
 const POLL_INTERVAL_MS = 3000;
+// Kilo JWT tokens expire in 5 years, use same expiry
+const KILO_TOKEN_EXPIRY_MS = 5 * 365.25 * 24 * 60 * 60 * 1000;
 const MODELS_FETCH_TIMEOUT_MS = 10_000;
 const KILO_TOS_URL = "https://kilo.ai/terms";
 const KILO_PROFILE_ENDPOINT = `${KILO_API_BASE}/api/profile`;
@@ -84,12 +85,6 @@ interface DeviceAuthPollResponse {
   userEmail?: string;
 }
 
-interface TokenRefreshResponse {
-  access_token: string;
-  refresh_token: string;
-  expires_in: number;
-}
-
 function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
@@ -114,6 +109,8 @@ function isTokenFresh(tokenExpiry: number | null, now: number): boolean {
 
 const refreshPromises = new Map<string, Promise<OAuthCredential>>();
 
+// Kilo uses long-lived JWT tokens from device auth flow - no separate refresh needed.
+// The token is used directly as Bearer token for API calls.
 async function refreshAccessToken(
   currentCredentials: OAuthCredential,
 ): Promise<OAuthCredential> {
@@ -122,28 +119,13 @@ async function refreshAccessToken(
   if (cached) return cached;
 
   const promise = (async () => {
-    const response = await fetch(KILO_TOKEN_REFRESH_ENDPOINT, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        grant_type: "refresh_token",
-        refresh_token: currentCredentials.refresh,
-        client_id: "opencode-cli",
-      }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`Token refresh failed: ${response.status}`);
-    }
-
-    const data = (await response.json()) as TokenRefreshResponse;
-    const newCreds: OAuthCredential = {
-      type: "oauth",
-      access: data.access_token,
-      refresh: data.refresh_token,
-      expires: Date.now() + data.expires_in * 1000,
+    console.log("[kilo] Token refresh requested - Kilo uses long-lived JWTs, no refresh needed");
+    // Kilo tokens are JWTs from device auth that work directly as Bearer tokens.
+    // Just extend the expiry to match Kilo's JWT expiry (~6 years).
+    return {
+      ...currentCredentials,
+      expires: Date.now() + KILO_TOKEN_EXPIRY_MS,
     };
-    return newCreds;
   })();
 
   refreshPromises.set(cacheKey, promise);
@@ -409,11 +391,12 @@ export default async function (pi: ExtensionAPI) {
                 throw new Error("Authorization approved but no token received");
               }
               cb.onProgress?.("Login successful!");
+              // Kilo tokens are long-lived JWTs - set expiry to ~6 years
               return {
                 type: "oauth",
                 refresh: result.token,
                 access: result.token,
-                expires: Date.now() + 3600 * 1000,
+                expires: Date.now() + KILO_TOKEN_EXPIRY_MS,
               };
             }
 
@@ -449,8 +432,17 @@ export default async function (pi: ExtensionAPI) {
         if (isTokenFresh(credentials.expires, Date.now())) {
           return credentials;
         }
-        const newCreds = await refreshAccessToken(credentials);
-        return newCreds;
+        try {
+          const newCreds = await refreshAccessToken(credentials);
+          return newCreds;
+        } catch (error) {
+          console.warn("[kilo] Token refresh failed, keeping existing credentials:", error instanceof Error ? error.message : error);
+          // Return existing credentials with extended expiry to avoid repeated refresh attempts
+          return {
+            ...credentials,
+            expires: Date.now() + KILO_TOKEN_EXPIRY_MS,
+          };
+        }
       },
       getApiKey: (cred) => cred.access,
     },
