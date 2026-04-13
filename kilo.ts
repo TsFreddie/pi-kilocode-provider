@@ -262,7 +262,7 @@ async function saveModelsToCache(models: KiloModel[], free: boolean) {
     const { homedir } = await import("os");
     const { join } = await import("path");
     const cacheDir = join(homedir(), ".cache", "pi");
-    mkdirSync(cacheDir, {recursive: true});
+    mkdirSync(cacheDir, { recursive: true });
     const cachePath = join(cacheDir, MODELS_CACHE_FILE);
     writeFileSync(cachePath, JSON.stringify({ models, free }), "utf-8");
   } catch (error) {
@@ -282,7 +282,7 @@ async function loadModelsFromCache(): Promise<{
     const { homedir } = await import("os");
     const { join } = await import("path");
     const cacheDir = join(homedir(), ".cache", "pi");
-    mkdirSync(cacheDir, {recursive: true});
+    mkdirSync(cacheDir, { recursive: true });
     const cachePath = join(cacheDir, MODELS_CACHE_FILE);
     if (!existsSync(cachePath)) return null;
     const data = readFileSync(cachePath, "utf-8");
@@ -509,10 +509,13 @@ export default async function (pi: ExtensionAPI) {
 
   // Update credits display when model changes to a Kilo model
   pi.on("model_select", async (event, ctx) => {
-    if (event.model?.provider !== "kilo") return;
-
     const cred = ctx.modelRegistry.authStorage.get("kilo");
-    if (cred?.type !== "oauth") return;
+
+    // Clear credits if not logged in or not using Kilo models
+    if (cred?.type !== "oauth" || ctx.model?.provider !== "kilo") {
+      ctx.ui.setStatus("kilo-credits", undefined);
+      return;
+    }
 
     try {
       const balance = await fetchKiloBalance(cred.access);
@@ -533,7 +536,12 @@ export default async function (pi: ExtensionAPI) {
   // Refresh credits after each turn
   pi.on("turn_end", async (_event, ctx) => {
     const cred = ctx.modelRegistry.authStorage.get("kilo");
-    if (cred?.type !== "oauth") return;
+
+    // Clear credits if not logged in or not using Kilo models
+    if (cred?.type !== "oauth" || ctx.model?.provider !== "kilo") {
+      ctx.ui.setStatus("kilo-credits", undefined);
+      return;
+    }
 
     try {
       const balance = await fetchKiloBalance(cred.access);
@@ -573,171 +581,5 @@ export default async function (pi: ExtensionAPI) {
         display: true,
       },
     };
-  });
-
-  // Use custom footer to show credits inline with token stats
-  pi.on("session_start", async (_event, ctx) => {
-    ctx.ui.setFooter((tui, theme, footerData) => {
-      const unsubBranch = footerData.onBranchChange(() => tui.requestRender());
-
-      const formatTokens = (count: number): string => {
-        if (count < 1000) return count.toString();
-        if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-        if (count < 1000000) return `${Math.round(count / 1000)}k`;
-        if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
-        return `${Math.round(count / 1000000)}M`;
-      };
-
-      return {
-        dispose() {
-          unsubBranch();
-        },
-        invalidate() {},
-        render(width: number): string[] {
-          const model = ctx.model;
-
-          // Match built-in footer totals: all assistant messages across all entries
-          let totalInput = 0;
-          let totalOutput = 0;
-          let totalCacheRead = 0;
-          let totalCacheWrite = 0;
-          let totalCost = 0;
-          for (const entry of ctx.sessionManager.getEntries()) {
-            if (
-              entry.type === "message" &&
-              entry.message.role === "assistant"
-            ) {
-              totalInput += entry.message.usage.input;
-              totalOutput += entry.message.usage.output;
-              totalCacheRead += entry.message.usage.cacheRead;
-              totalCacheWrite += entry.message.usage.cacheWrite;
-              totalCost += entry.message.usage.cost.total;
-            }
-          }
-
-          // Match built-in context usage behavior
-          const contextUsage = ctx.getContextUsage();
-          const contextWindow =
-            contextUsage?.contextWindow ?? model?.contextWindow ?? 0;
-          const contextPercentValue = contextUsage?.percent ?? 0;
-          const contextPercent =
-            contextUsage?.percent !== null
-              ? contextPercentValue.toFixed(1)
-              : "?";
-
-          // Build pwd line like built-in (path + branch + session name)
-          let pwd = process.cwd();
-          const home = process.env.HOME || process.env.USERPROFILE;
-          if (home && pwd.startsWith(home)) pwd = `~${pwd.slice(home.length)}`;
-          const branch = footerData.getGitBranch();
-          if (branch) pwd = `${pwd} (${branch})`;
-          const sessionName = ctx.sessionManager.getSessionName();
-          if (sessionName) pwd = `${pwd} • ${sessionName}`;
-
-          if (pwd.length > width) {
-            const half = Math.floor(width / 2) - 2;
-            if (half > 1) {
-              pwd = `${pwd.slice(0, half)}...${pwd.slice(-(half - 1))}`;
-            } else {
-              pwd = pwd.slice(0, Math.max(1, width));
-            }
-          }
-
-          const statsParts: string[] = [];
-          if (totalInput) statsParts.push(`↑${formatTokens(totalInput)}`);
-          if (totalOutput) statsParts.push(`↓${formatTokens(totalOutput)}`);
-          if (totalCacheRead)
-            statsParts.push(`R${formatTokens(totalCacheRead)}`);
-          if (totalCacheWrite)
-            statsParts.push(`W${formatTokens(totalCacheWrite)}`);
-
-          const usingSubscription = model
-            ? ctx.modelRegistry.isUsingOAuth(model)
-            : false;
-          if (totalCost || usingSubscription) {
-            statsParts.push(
-              `$${totalCost.toFixed(3)}${usingSubscription ? " (sub)" : ""}`,
-            );
-          }
-
-          const autoIndicator = " (auto)";
-          const contextPercentDisplay =
-            contextPercent === "?"
-              ? `?/${formatTokens(contextWindow)}${autoIndicator}`
-              : `${contextPercent}%/${formatTokens(contextWindow)}${autoIndicator}`;
-
-          let contextPercentStr: string;
-          if (contextPercentValue > 90) {
-            contextPercentStr = theme.fg("error", contextPercentDisplay);
-          } else if (contextPercentValue > 70) {
-            contextPercentStr = theme.fg("warning", contextPercentDisplay);
-          } else {
-            contextPercentStr = contextPercentDisplay;
-          }
-          statsParts.push(contextPercentStr);
-
-          // Inject credits inline on the main stats line
-          const creditsStatus = footerData
-            .getExtensionStatuses()
-            .get("kilo-credits");
-          if (creditsStatus) statsParts.push(creditsStatus);
-
-          let statsLeft = statsParts.join(" ");
-          let statsLeftWidth = visibleWidth(statsLeft);
-
-          // Right side: model + thinking + provider like built-in
-          const modelName = model?.id || "no-model";
-          let rightSideWithoutProvider = modelName;
-          if (model?.reasoning) {
-            const thinkingLevel = pi.getThinkingLevel() || "off";
-            rightSideWithoutProvider =
-              thinkingLevel === "off"
-                ? `${modelName} • thinking off`
-                : `${modelName} • ${thinkingLevel}`;
-          }
-
-          let rightSide = rightSideWithoutProvider;
-          if (footerData.getAvailableProviderCount() > 1 && model) {
-            rightSide = `(${model.provider}) ${rightSideWithoutProvider}`;
-            if (statsLeftWidth + 2 + visibleWidth(rightSide) > width) {
-              rightSide = rightSideWithoutProvider;
-            }
-          }
-
-          if (statsLeftWidth > width) {
-            const plainStatsLeft = statsLeft.replace(/\x1b\[[0-9;]*m/g, "");
-            statsLeft = `${plainStatsLeft.substring(0, width - 3)}...`;
-            statsLeftWidth = visibleWidth(statsLeft);
-          }
-
-          const rightSideWidth = visibleWidth(rightSide);
-          const totalNeeded = statsLeftWidth + 2 + rightSideWidth;
-
-          let statsLine: string;
-          if (totalNeeded <= width) {
-            const padding = " ".repeat(width - statsLeftWidth - rightSideWidth);
-            statsLine = statsLeft + padding + rightSide;
-          } else {
-            const availableForRight = width - statsLeftWidth - 2;
-            if (availableForRight > 3) {
-              const plainRight = rightSide.replace(/\x1b\[[0-9;]*m/g, "");
-              const truncatedRight = plainRight.substring(0, availableForRight);
-              const padding = " ".repeat(
-                width - statsLeftWidth - truncatedRight.length,
-              );
-              statsLine = statsLeft + padding + truncatedRight;
-            } else {
-              statsLine = statsLeft;
-            }
-          }
-
-          const dimStatsLeft = theme.fg("dim", statsLeft);
-          const remainder = statsLine.slice(statsLeft.length);
-          const dimRemainder = theme.fg("dim", remainder);
-
-          return [theme.fg("dim", pwd), dimStatsLeft + dimRemainder];
-        },
-      };
-    });
   });
 }
