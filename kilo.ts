@@ -119,7 +119,6 @@ async function refreshAccessToken(
   if (cached) return cached;
 
   const promise = (async () => {
-    console.log("[kilo] Token refresh requested - Kilo uses long-lived JWTs, no refresh needed");
     // Kilo tokens are JWTs from device auth that work directly as Bearer tokens.
     // Just extend the expiry to match Kilo's JWT expiry (~6 years).
     return {
