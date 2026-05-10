@@ -1,0 +1,24 @@
+{
+  "name": "@tsfreddie/pi-kilocode-provider",
+  "version": "1.3.0",
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "BSL-1.0",
+  "pi": {
+    "extensions": [
+      "./kilo.ts"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TsFreddie/pi-kilocode-provider.git"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "latest",
+    "@types/bun": "latest",
+    "typescript": "^6.0.3"
+  },
+  "private": true
+}
