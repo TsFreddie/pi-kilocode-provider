@@ -12,6 +12,7 @@
 import type {
   ExtensionAPI,
   OAuthCredential,
+  ProviderConfig,
   ProviderModelConfig,
 } from "@earendil-works/pi-coding-agent";
 import { mkdirSync, readFileSync, existsSync, access } from "fs";
@@ -253,6 +254,20 @@ interface KiloModel {
   supported_parameters?: string[];
   preferredIndex?: number;
   isFree?: boolean;
+  openclaw?: {
+    api_adapter?: string;
+  };
+  opencode?: {
+    ai_sdk_provider?: string;
+    family?: string;
+    prompt?: string;
+    variants?: {
+      [level: string]: {
+        reasoning?: { enabled: boolean; effort: string };
+        verbosity?: string;
+      };
+    };
+  };
 }
 
 function formatPrice(price: string | null | undefined): string {
@@ -300,7 +315,35 @@ function parsePrice(price: string | null | undefined): number {
  */
 function getKiloCompat(m: KiloModel): ProviderModelConfig["compat"] {
   const prefix = m.id.split("/")[0] ?? "";
+  const sdkProvider = m.opencode?.ai_sdk_provider;
 
+  // Derive compat settings from both the SDK provider and the ID prefix
+  // independently, then merge them together.
+  const fromProvider = getCompatFromSdkProvider(sdkProvider);
+  const fromPrefix = getCompatFromPrefix(prefix);
+
+  return {
+    ...fromProvider,
+    ...fromPrefix,
+  };
+}
+
+function getCompatFromSdkProvider(
+  sdkProvider: string | undefined,
+): Partial<ProviderModelConfig["compat"]> {
+  switch (sdkProvider) {
+    case "anthropic":
+      return { cacheControlFormat: "anthropic" };
+    case "alibaba":
+      return { supportsDeveloperRole: false };
+    default:
+      return {};
+  }
+}
+
+function getCompatFromPrefix(
+  prefix: string,
+): Partial<ProviderModelConfig["compat"]> {
   switch (prefix) {
     case "deepseek":
       return {
@@ -326,14 +369,53 @@ function getKiloCompat(m: KiloModel): ProviderModelConfig["compat"] {
     case "anthropic":
       return { cacheControlFormat: "anthropic" };
     default:
-      return { thinkingFormat: "openrouter" };
+      return {};
   }
 }
+
+// Map from Kilo variant keys to pi thinking level keys.
+const VARIANT_TO_PI_LEVEL: Record<string, string> = {
+  none: "off",
+  instant: "minimal",
+  low: "low",
+  medium: "medium",
+  high: "high",
+  max: "xhigh",
+  xhigh: "xhigh",
+  thinking: "medium",
+};
 
 /**
  * Build per-model overrides (thinking levels, etc.) from Kilo model metadata.
  */
 function getKiloModelOverrides(m: KiloModel): Partial<ProviderModelConfig> {
+  // Use opencode.variants if available for reasoning level mapping
+  const variants = m.opencode?.variants;
+  if (variants) {
+    const thinkingLevelMap: Record<string, string | null> = {};
+    let hasNonNone = false;
+    for (const [level, config] of Object.entries(variants)) {
+      const piLevel = VARIANT_TO_PI_LEVEL[level];
+      if (!piLevel) continue;
+      const effort = config.reasoning?.effort;
+      if (piLevel === "off") {
+        // The "off" level means no reasoning; mark as unsupported.
+        thinkingLevelMap[piLevel] = null;
+      } else {
+        // Use the variant's effort value directly (even "none").
+        thinkingLevelMap[piLevel] = effort ?? null;
+        if (effort) hasNonNone = true;
+      }
+    }
+    const result: Partial<ProviderModelConfig> = {
+      thinkingLevelMap,
+    };
+    if (hasNonNone) {
+      return result;
+    }
+  }
+
+  // Fallback to hardcoded mappings for known models
   switch (m.id) {
     case "deepseek/deepseek-v4-pro":
     case "deepseek/deepseek-v4-flash":
@@ -354,8 +436,22 @@ function getKiloModelOverrides(m: KiloModel): Partial<ProviderModelConfig> {
 function mapOpenRouterModel(m: KiloModel): ProviderModelConfig {
   const inputModalities = m.architecture?.input_modalities ?? ["text"];
   const supportsImages = inputModalities.includes("image");
-  const supportsReasoning =
+  // Reasoning support: check both the API's supported_parameters and
+  // the presence of opencode.variants with reasoning effort levels.
+  const hasReasoningParam =
     m.supported_parameters?.includes("reasoning") ?? false;
+  const hasReasoningVariants = Object.entries(
+    m.opencode?.variants ?? {},
+  ).some(([level, v]) => {
+    const piLevel = VARIANT_TO_PI_LEVEL[level];
+    return (
+      piLevel &&
+      piLevel !== "off" &&
+      v.reasoning?.effort &&
+      v.reasoning.effort !== "none"
+    );
+  });
+  const supportsReasoning = hasReasoningParam || hasReasoningVariants;
   const maxTokens =
     m.top_provider?.max_completion_tokens ??
     m.max_completion_tokens ??
@@ -363,9 +459,42 @@ function mapOpenRouterModel(m: KiloModel): ProviderModelConfig {
 
   const overrides = getKiloModelOverrides(m);
 
+  // Map Kilo/OpenRouter api_adapter to pi Api type.
+  // Default is "openai-completions" for most models.
+  let modelApi: ProviderModelConfig["api"]; // Api type
+  const adapter = m.openclaw?.api_adapter;
+  if (adapter === "openai-responses") {
+    modelApi = adapter;
+  }
+
+  // Also check opencode metadata for Anthropic models.
+  // OpenRouter/Kilo marks Anthropic models with ai_sdk_provider or prompt "anthropic".
+  if (!modelApi) {
+    const oc = m.opencode;
+    if (
+      oc?.ai_sdk_provider === "anthropic" ||
+      oc?.prompt === "anthropic" ||
+      oc?.family === "claude"
+    ) {
+      modelApi = "anthropic-messages";
+    }
+  }
+
+  // ai_sdk_provider can also directly specify the API type (openai, anthropic, alibaba)
+  if (!modelApi && m.opencode?.ai_sdk_provider) {
+    const provider = m.opencode.ai_sdk_provider;
+    if (provider === "anthropic") {
+      modelApi = "anthropic-messages";
+    } else if (provider === "openai") {
+      modelApi = "openai-completions";
+    }
+    // alibaba (Qwen) uses default openai-completions format
+  }
+
   return {
     id: m.id,
     name: `${m.name}${formatModelPriceLabel(m)}`,
+    api: modelApi,
     reasoning: supportsReasoning,
     input: supportsImages ? ["text", "image"] : ["text"],
     cost: {
@@ -386,6 +515,7 @@ let modelList: ProviderModelConfig[] = [];
 let modelUpdated = false;
 
 const MODELS_CACHE_FILE = `pi-kilo-models-cache.json`;
+const TOS_CACHE_FILE = `pi-kilo-tos-shown.json`;
 
 async function saveModelsToCache(models: KiloModel[], free: boolean) {
   try {
@@ -418,6 +548,36 @@ function loadModelsFromCache(): {
     return parsed;
   } catch {
     return null;
+  }
+}
+
+/** Synchronous: reads tosShown from cache. */
+function loadTosShownFromCache(): boolean {
+  try {
+    const cacheDir = join(homedir(), ".cache", "pi");
+    mkdirSync(cacheDir, { recursive: true });
+    const cachePath = join(cacheDir, TOS_CACHE_FILE);
+    if (!existsSync(cachePath)) return false;
+    const data = readFileSync(cachePath, "utf-8");
+    return data === "true";
+  } catch {
+    return false;
+  }
+}
+
+/** Persist tosShown to cache file. */
+function saveTosShownToCache(value: boolean): void {
+  try {
+    const cacheDir = join(homedir(), ".cache", "pi");
+    mkdirSync(cacheDir, { recursive: true });
+    const cachePath = join(cacheDir, TOS_CACHE_FILE);
+    import("fs/promises").then(({ writeFile }) =>
+      writeFile(cachePath, String(value), "utf-8"),
+    ).catch(() => {
+      // Silently fail
+    });
+  } catch {
+    // Silently fail
   }
 }
 
@@ -470,10 +630,11 @@ async function updateKiloModels(free: boolean) {
 // Provider Config
 // =============================================================================
 
-const KILO_PROVIDER_CONFIG = {
+const KILO_PROVIDER_CONFIG: Partial<ProviderConfig> = {
   baseUrl: KILO_GATEWAY_BASE,
-  api: "openai-completions" as const,
-  apiKey: "", // no api key required to use free models 
+  api: "openai-completions",
+  authHeader: true,
+  apiKey: "<none>", // no api key required to use free models 
   headers: {
     "X-KILOCODE-EDITORNAME": "Pi",
     "User-Agent": "pi-kilo-provider",
@@ -664,7 +825,8 @@ export default async function (pi: ExtensionAPI) {
   });
 
   // On first use of a Kilo model without login, print ToS notice.
-  let tosShown = false;
+  // Persisted to cache so it only shows once per user.
+  let tosShown = loadTosShownFromCache();
 
   pi.on("before_agent_start", async (_event, ctx) => {
     if (tosShown) return;
@@ -673,10 +835,12 @@ export default async function (pi: ExtensionAPI) {
     const cred = ctx.modelRegistry.authStorage.get("kilo");
     if (cred?.type === "oauth") {
       tosShown = true;
+      saveTosShownToCache(true);
       return;
     }
 
     tosShown = true;
+    saveTosShownToCache(true);
 
     return {
       message: {
