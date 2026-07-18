@@ -15,6 +15,7 @@ import type {
   ProviderConfig,
   ProviderModelConfig,
 } from "@earendil-works/pi-coding-agent";
+import { readStoredCredential } from "@earendil-works/pi-coding-agent";
 import { mkdirSync, readFileSync, existsSync, access } from "fs";
 import { homedir } from "os";
 import { join } from "path";
@@ -762,7 +763,7 @@ export default async function (pi: ExtensionAPI) {
   // After session starts, pre-fetch all models if already logged in so
   // modifyModels has data to work with. Also fetch and display credits.
   pi.on("session_start", async (_event, ctx) => {
-    const cred = ctx.modelRegistry.authStorage.get("kilo");
+    const cred = readStoredCredential("kilo");
 
     let updating = false;
     if (!cred !== loaded?.free || !modelUpdated) {
@@ -798,7 +799,7 @@ export default async function (pi: ExtensionAPI) {
 
   // Update credits display when model changes to a Kilo model
   pi.on("model_select", async (event, ctx) => {
-    const cred = ctx.modelRegistry.authStorage.get("kilo");
+    const cred = readStoredCredential("kilo");
 
     // Clear credits if not logged in or not using Kilo models
     if (cred?.type !== "oauth" || ctx.model?.provider !== "kilo") {
@@ -812,7 +813,7 @@ export default async function (pi: ExtensionAPI) {
 
   // Refresh credits after each turn
   pi.on("turn_end", async (_event, ctx) => {
-    const cred = ctx.modelRegistry.authStorage.get("kilo");
+    const cred = readStoredCredential("kilo");
 
     // Clear credits if not logged in or not using Kilo models
     if (cred?.type !== "oauth" || ctx.model?.provider !== "kilo") {
@@ -832,7 +833,7 @@ export default async function (pi: ExtensionAPI) {
     if (tosShown) return;
     if (ctx.model?.provider !== "kilo") return;
 
-    const cred = ctx.modelRegistry.authStorage.get("kilo");
+    const cred = readStoredCredential("kilo");
     if (cred?.type === "oauth") {
       tosShown = true;
       saveTosShownToCache(true);
