@@ -11,12 +11,12 @@
 
 import type {
   ExtensionAPI,
-  OAuthCredential,
   ProviderConfig,
   ProviderModelConfig,
 } from "@earendil-works/pi-coding-agent";
 import { readStoredCredential } from "@earendil-works/pi-coding-agent";
-import { mkdirSync, readFileSync, existsSync, access } from "fs";
+import type { OAuthCredential, RefreshModelsContext } from "@earendil-works/pi-ai";
+import { mkdirSync, readFileSync, existsSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
@@ -506,51 +506,41 @@ function mapOpenRouterModel(m: KiloModel): ProviderModelConfig {
     },
     contextWindow: m.context_length,
     maxTokens: maxTokens,
+    headers: { "x-kilo-free": String(!!m.isFree) },
     compat: getKiloCompat(m),
     ...overrides,
   };
 }
 
-// States
-let modelList: ProviderModelConfig[] = [];
-let modelUpdated = false;
+// =============================================================================
+// Model List Management
+// =============================================================================
 
-const MODELS_CACHE_FILE = `pi-kilo-models-cache.json`;
+/** Build ProviderModelConfig[] from raw Kilo API models. Pure function. */
+function buildModelConfigs(models: KiloModel[]): ProviderModelConfig[] {
+  return models
+    .filter((m) => {
+      const outputMods = m.architecture?.output_modalities ?? [];
+      if (outputMods.includes("image")) return false;
+      return true;
+    })
+    .sort(
+      (a, b) =>
+        (a.preferredIndex || Infinity) - (b.preferredIndex || Infinity),
+    )
+    .map(mapOpenRouterModel);
+}
+
+/** Filter a model config list to only free-tier models (tagged via x-kilo-free header). */
+function filterFreeModels(configs: ProviderModelConfig[]): ProviderModelConfig[] {
+  return configs.filter((m) => m.headers?.["x-kilo-free"] === "true");
+}
+
+// =============================================================================
+// ToS Cache
+// =============================================================================
+
 const TOS_CACHE_FILE = `pi-kilo-tos-shown.json`;
-
-async function saveModelsToCache(models: KiloModel[], free: boolean) {
-  try {
-    const { writeFile } = await import("fs/promises");
-    const cacheDir = join(homedir(), ".cache", "pi");
-    mkdirSync(cacheDir, { recursive: true });
-    const cachePath = join(cacheDir, MODELS_CACHE_FILE);
-    await writeFile(cachePath, JSON.stringify({ models, free }), "utf-8");
-  } catch (error) {
-    console.warn(
-      "[kilo] Failed to save models cache:",
-      error instanceof Error ? error.message : error,
-    );
-  }
-}
-
-/** Synchronous: reads from local disk cache. Fast, no I/O wait. */
-function loadModelsFromCache(): {
-  models: KiloModel[];
-  free: boolean;
-} | null {
-  try {
-    const cacheDir = join(homedir(), ".cache", "pi");
-    mkdirSync(cacheDir, { recursive: true });
-    const cachePath = join(cacheDir, MODELS_CACHE_FILE);
-    if (!existsSync(cachePath)) return null;
-    const data = readFileSync(cachePath, "utf-8");
-    const parsed = JSON.parse(data);
-    if (!parsed || !Array.isArray(parsed.models)) return null;
-    return parsed;
-  } catch {
-    return null;
-  }
-}
 
 /** Synchronous: reads tosShown from cache. */
 function loadTosShownFromCache(): boolean {
@@ -582,210 +572,178 @@ function saveTosShownToCache(value: boolean): void {
   }
 }
 
-function updateModels(models: KiloModel[], free: boolean) {
-  modelList.length = 0;
-  modelList.push(
-    ...models
-      .filter((m) => {
-        const outputMods = m.architecture?.output_modalities ?? [];
-        if (outputMods.includes("image")) return false;
-        if (free && !m.isFree) return false;
-        return true;
-      })
-      .sort(
-        (a, b) =>
-          (a.preferredIndex || Infinity) - (b.preferredIndex || Infinity),
-      )
-      .map(mapOpenRouterModel),
-  );
-}
-
-async function updateKiloModels(free: boolean) {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    "User-Agent": "pi-kilo-provider",
-  };
-
-  const response = await fetch(`${KILO_GATEWAY_BASE}/models`, {
-    headers,
-    signal: AbortSignal.timeout(MODELS_FETCH_TIMEOUT_MS),
-  });
-
-  if (!response.ok) {
-    throw new Error(
-      `Failed to fetch models: ${response.status} ${response.statusText}`,
-    );
-  }
-
-  const json = (await response.json()) as { data?: KiloModel[] };
-  if (!json.data || !Array.isArray(json.data)) {
-    throw new Error("Invalid models response: missing data array");
-  }
-
-  await saveModelsToCache(json.data, free);
-  updateModels(json.data, free);
-  modelUpdated = true;
-}
-
 // =============================================================================
 // Provider Config
 // =============================================================================
 
-const KILO_PROVIDER_CONFIG: Partial<ProviderConfig> = {
+const KILO_PROVIDER_BASE: Partial<ProviderConfig> = {
   baseUrl: KILO_GATEWAY_BASE,
   api: "openai-completions",
   authHeader: true,
-  apiKey: "<none>", // no api key required to use free models 
+  apiKey: "free", // default: show only free models until logged in or real API key set
   headers: {
     "X-KILOCODE-EDITORNAME": "Pi",
     "User-Agent": "pi-kilo-provider",
   },
 };
 
+const KILO_OAUTH = {
+  name: "Kilo" as const,
+  login: async (callbacks: any) => {
+    async function loginKilo(
+      cb: typeof callbacks,
+    ): Promise<OAuthCredential> {
+      cb.onProgress?.("Initiating device authorization...");
+      const authData = await initiateDeviceAuth();
+      const { code, verificationUrl, expiresIn } = authData;
+
+      cb.onAuth({
+        url: verificationUrl,
+        instructions: `Enter code: ${code}`,
+      });
+
+      cb.onProgress?.("Waiting for browser authorization...");
+
+      const deadline = Date.now() + expiresIn * 1000;
+      while (Date.now() < deadline) {
+        if (cb.signal?.aborted) {
+          throw new Error("Login cancelled");
+        }
+
+        await abortableSleep(POLL_INTERVAL_MS, cb.signal);
+
+        const result = await pollDeviceAuth(code);
+
+        if (result.status === "approved") {
+          if (!result.token) {
+            throw new Error("Authorization approved but no token received");
+          }
+          cb.onProgress?.("Login successful!");
+          // Kilo tokens are long-lived JWTs - set expiry to ~6 years
+          return {
+            type: "oauth",
+            refresh: result.token,
+            access: result.token,
+            expires: Date.now() + KILO_TOKEN_EXPIRY_MS,
+          };
+        }
+
+        if (result.status === "denied") {
+          throw new Error("Authorization denied by user.");
+        }
+
+        if (result.status === "expired") {
+          throw new Error("Authorization code expired. Please try again.");
+        }
+      }
+
+      throw new Error("Authentication timed out. Please try again.");
+    }
+
+    const cred = await loginKilo(callbacks);
+    return cred;
+  },
+  refreshToken: async (credentials: OAuthCredential) => {
+    if (isTokenFresh(credentials.expires, Date.now())) {
+      return credentials;
+    }
+    try {
+      const newCreds = await refreshAccessToken(credentials);
+      return newCreds;
+    } catch (error) {
+      console.warn("[kilo] Token refresh failed, keeping existing credentials:", error instanceof Error ? error.message : error);
+      // Return existing credentials with extended expiry to avoid repeated refresh attempts
+      return {
+        ...credentials,
+        expires: Date.now() + KILO_TOKEN_EXPIRY_MS,
+      };
+    }
+  },
+  getApiKey: (cred: OAuthCredential) => cred.access,
+};
+
 // =============================================================================
 // Extension Entry Point
 // =============================================================================
 
-export default async function (pi: ExtensionAPI) {
-  // Load cached models synchronously so models are available at registration time.
-  const loaded = loadModelsFromCache();
-  if (loaded) {
-    updateModels(loaded.models, loaded.free);
-  } else {
-    // First run: no cache. We must fetch models so pi has something to register.
-    // This only blocks on the very first launch.
-    try {
-      await updateKiloModels(true);
-    } catch (error) {
-      console.warn(
-        "[kilo] Failed to fetch initial models:",
-        error instanceof Error ? error.message : error,
-      );
-    }
+/** pi calls this automatically to refresh the model catalog.
+ *  Uses pi's built-in ProviderModelsStore for persistence (models-store.json)
+ *  and provides the current OAuth credential, network status, and abort signal. */
+async function refreshModels(ctx: RefreshModelsContext): Promise<ProviderModelConfig[]> {
+  // Show only free models when no credential, or when using the "free" placeholder key.
+  // OAuth login or a real API key unlocks the full catalog.
+  const isFreeKey = ctx.credential?.type === "api_key" && (ctx.credential as { key?: string }).key === "free";
+  const freeOnly = !ctx.credential || isFreeKey;
+
+  // Check persistent store for cached models (managed by pi)
+  const cached = await ctx.store.read();
+
+  // Helper: cast and optionally filter cached models
+  const fromCache = (): ProviderModelConfig[] => {
+    const configs = [...cached!.models] as unknown as ProviderModelConfig[];
+    return freeOnly ? filterFreeModels(configs) : configs;
+  };
+
+  // Offline: return cached models if available
+  if (!ctx.allowNetwork) {
+    return cached?.models.length ? fromCache() : [];
   }
 
-  // Always refresh models from the network in the background.
-  // Preserve the cached free/all mode to avoid downgrading from all→free on restart.
-  updateKiloModels(loaded?.free ?? true).catch((error) => {
-    console.warn(
-      "[kilo] Failed to fetch initial models:",
-      error instanceof Error ? error.message : error,
-    );
-  });
+  // Use cache if fresh enough and not forced refresh
+  if (!ctx.force && cached?.checkedAt) {
+    const age = Date.now() - cached.checkedAt;
+    if (age < 5 * 60 * 1000) return fromCache();
+  }
 
+  // Fetch from Kilo API
+  try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "User-Agent": "pi-kilo-provider",
+    };
+
+    const response = await fetch(`${KILO_GATEWAY_BASE}/models`, {
+      headers,
+      signal: ctx.signal ?? AbortSignal.timeout(MODELS_FETCH_TIMEOUT_MS),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch models: ${response.status} ${response.statusText}`);
+    }
+
+    const json = (await response.json()) as { data?: KiloModel[] };
+    if (!json.data || !Array.isArray(json.data)) {
+      throw new Error("Invalid models response: missing data array");
+    }
+
+    // Always cache the full catalog so auth state changes don't require a re-fetch.
+    // Free models are tagged via x-kilo-free header; filter at return time only.
+    const fullConfigs = buildModelConfigs(json.data);
+    await ctx.store.write({ models: fullConfigs as any, checkedAt: Date.now() });
+
+    return freeOnly ? filterFreeModels(fullConfigs) : fullConfigs;
+  } catch (error) {
+    // On network failure, fall back to cached models
+    if (cached?.models.length) return fromCache();
+    throw error;
+  }
+}
+
+// =============================================================================
+// Extension Entry Point
+// =============================================================================
+
+export default function (pi: ExtensionAPI) {
   pi.registerProvider("kilo", {
-    ...KILO_PROVIDER_CONFIG,
-    models: modelList,
-    oauth: {
-      name: "Kilo",
-      login: async (callbacks) => {
-        async function loginKilo(
-          cb: typeof callbacks,
-        ): Promise<OAuthCredential> {
-          cb.onProgress?.("Initiating device authorization...");
-          const authData = await initiateDeviceAuth();
-          const { code, verificationUrl, expiresIn } = authData;
-
-          cb.onAuth({
-            url: verificationUrl,
-            instructions: `Enter code: ${code}`,
-          });
-
-          cb.onProgress?.("Waiting for browser authorization...");
-
-          const deadline = Date.now() + expiresIn * 1000;
-          while (Date.now() < deadline) {
-            if (cb.signal?.aborted) {
-              throw new Error("Login cancelled");
-            }
-
-            await abortableSleep(POLL_INTERVAL_MS, cb.signal);
-
-            const result = await pollDeviceAuth(code);
-
-            if (result.status === "approved") {
-              if (!result.token) {
-                throw new Error("Authorization approved but no token received");
-              }
-              cb.onProgress?.("Login successful!");
-              // Kilo tokens are long-lived JWTs - set expiry to ~6 years
-              return {
-                type: "oauth",
-                refresh: result.token,
-                access: result.token,
-                expires: Date.now() + KILO_TOKEN_EXPIRY_MS,
-              };
-            }
-
-            if (result.status === "denied") {
-              throw new Error("Authorization denied by user.");
-            }
-
-            if (result.status === "expired") {
-              throw new Error("Authorization code expired. Please try again.");
-            }
-          }
-
-          throw new Error("Authentication timed out. Please try again.");
-        }
-
-        const cred = await loginKilo(callbacks);
-        try {
-          await updateKiloModels(!cred?.access);
-        } catch (error) {
-          console.warn(
-            "[kilo] Failed to fetch models on session start:",
-            error instanceof Error ? error.message : error,
-          );
-        }
-        return cred;
-      },
-      refreshToken: async (credentials: OAuthCredential) => {
-        if (isTokenFresh(credentials.expires, Date.now())) {
-          return credentials;
-        }
-        try {
-          const newCreds = await refreshAccessToken(credentials);
-          return newCreds;
-        } catch (error) {
-          console.warn("[kilo] Token refresh failed, keeping existing credentials:", error instanceof Error ? error.message : error);
-          // Return existing credentials with extended expiry to avoid repeated refresh attempts
-          return {
-            ...credentials,
-            expires: Date.now() + KILO_TOKEN_EXPIRY_MS,
-          };
-        }
-      },
-      getApiKey: (cred) => cred.access,
-    },
+    ...KILO_PROVIDER_BASE,
+    refreshModels,
+    oauth: KILO_OAUTH,
   });
 
-  // After session starts, pre-fetch all models if already logged in so
-  // modifyModels has data to work with. Also fetch and display credits.
+  // Display credits when logged in and using a Kilo model.
+  // Model catalog refresh is handled automatically by pi via refreshModels.
   pi.on("session_start", async (_event, ctx) => {
     const cred = readStoredCredential("kilo");
-
-    let updating = false;
-    if (!cred !== loaded?.free || !modelUpdated) {
-      updateKiloModels(!cred).catch((error) => {
-        console.warn(
-          "[kilo] Failed to fetch models on session start:",
-          error instanceof Error ? error.message : error,
-        );
-      }).then(() => {
-        ctx.modelRegistry.refresh();
-        // Update current model in case any capabilities are changed
-        // this is most likely happen to router models (e.g. kilo-auto)
-        const currentModel = ctx.model;
-        if (currentModel && currentModel.provider === "kilo") {
-          const model = ctx.modelRegistry.find("kilo", currentModel.id);
-          if (model) {
-            Object.assign(currentModel, model);
-          }
-        }
-      });
-      updating = true;
-    }
 
     // Clear credits if not logged in or not using Kilo models
     if (cred?.type !== "oauth" || ctx.model?.provider !== "kilo") {
