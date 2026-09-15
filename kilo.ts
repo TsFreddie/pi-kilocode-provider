@@ -14,7 +14,7 @@ import type {
   ProviderConfig,
   ProviderModelConfig,
 } from "@earendil-works/pi-coding-agent";
-import { readStoredCredential } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, readStoredCredential } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredential, RefreshModelsContext } from "@earendil-works/pi-ai";
 import { mkdirSync, readFileSync, existsSync } from "fs";
 import { homedir } from "os";
@@ -536,6 +536,19 @@ function filterFreeModels(configs: ProviderModelConfig[]): ProviderModelConfig[]
   return configs.filter((m) => m.headers?.["x-kilo-free"] === "true");
 }
 
+/**
+ * Free-tier models are the only ones usable without a real Kilo credential.
+ * Shared by the startup catalog restore and `refreshModels` so both agree on
+ * which models may be offered.
+ */
+function isFreeOnly(
+  credential: { type?: string; key?: string } | undefined,
+): boolean {
+  const isFreeKey =
+    credential?.type === "api_key" && credential.key === "free";
+  return !credential || isFreeKey;
+}
+
 // =============================================================================
 // Display Mode
 // =============================================================================
@@ -560,6 +573,34 @@ function forDisplayMode(models: ProviderModelConfig[]): ProviderModelConfig[] {
       ? model
       : { ...model, name: model.name.slice(0, suffix) };
   });
+}
+
+// =============================================================================
+// Startup Catalog Restore
+// =============================================================================
+
+/**
+ * pi persists the catalog we publish in `models-store.json` (next to
+ * `models.json` in the agent directory), but only hands it back asynchronously
+ * through `ctx.stored` inside `refreshModels`. Until that first refresh lands,
+ * the provider reports zero models, so a client that enumerates models once
+ * right after startup — pi's RPC `get_available_models`, which is what paseo's
+ * provider catalog fetch uses — sees an empty provider and caches that.
+ *
+ * Registering with the persisted catalog keeps the models available from the
+ * first moment; `refreshModels` still replaces them once the real refresh runs.
+ * Missing or unreadable stores just fall back to the previous empty behavior.
+ */
+function readPersistedCatalog(): ProviderModelConfig[] {
+  try {
+    const raw = readFileSync(join(getAgentDir(), "models-store.json"), "utf8");
+    const stored = JSON.parse(raw) as { kilo?: { models?: unknown } };
+    return Array.isArray(stored.kilo?.models)
+      ? (stored.kilo.models as ProviderModelConfig[])
+      : [];
+  } catch {
+    return [];
+  }
 }
 
 // =============================================================================
@@ -698,8 +739,7 @@ const KILO_OAUTH = {
 async function refreshModels(ctx: RefreshModelsContext): Promise<ProviderModelConfig[]> {
   // Show only free models when no credential, or when using the "free" placeholder key.
   // OAuth login or a real API key unlocks the full catalog.
-  const isFreeKey = ctx.credential?.type === "api_key" && (ctx.credential as { key?: string }).key === "free";
-  const freeOnly = !ctx.credential || isFreeKey;
+  const freeOnly = isFreeOnly(ctx.credential);
 
   // Last persisted catalog, captured by pi before this refresh phase.
   const cached = ctx.stored;
@@ -766,8 +806,19 @@ async function refreshModels(ctx: RefreshModelsContext): Promise<ProviderModelCo
 // =============================================================================
 
 export default function (pi: ExtensionAPI) {
+  // Register the persisted catalog up front: pi merges `refreshModels` results
+  // asynchronously, which leaves a startup window where the provider has no
+  // models for clients that enumerate once (see readPersistedCatalog).
+  const persistedCatalog = readPersistedCatalog();
+  const restoredModels = forDisplayMode(
+    isFreeOnly(readStoredCredential("kilo"))
+      ? filterFreeModels(persistedCatalog)
+      : persistedCatalog,
+  );
+
   pi.registerProvider("kilo", {
     ...KILO_PROVIDER_BASE,
+    ...(restoredModels.length > 0 ? { models: restoredModels } : {}),
     refreshModels,
     oauth: KILO_OAUTH,
   });
