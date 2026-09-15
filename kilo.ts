@@ -667,16 +667,16 @@ const KILO_OAUTH = {
 // =============================================================================
 
 /** pi calls this automatically to refresh the model catalog.
- *  Uses pi's built-in ProviderModelsStore for persistence (models-store.json)
- *  and provides the current OAuth credential, network status, and abort signal. */
+ *  pi owns the persistent catalog (models-store.json): it hands us a read-only
+ *  snapshot via `ctx.stored` and writes updates through `ctx.publish()`. */
 async function refreshModels(ctx: RefreshModelsContext): Promise<ProviderModelConfig[]> {
   // Show only free models when no credential, or when using the "free" placeholder key.
   // OAuth login or a real API key unlocks the full catalog.
   const isFreeKey = ctx.credential?.type === "api_key" && (ctx.credential as { key?: string }).key === "free";
   const freeOnly = !ctx.credential || isFreeKey;
 
-  // Check persistent store for cached models (managed by pi)
-  const cached = await ctx.store.read();
+  // Last persisted catalog, captured by pi before this refresh phase.
+  const cached = ctx.stored;
 
   // Helper: cast and optionally filter cached models
   const fromCache = (): ProviderModelConfig[] => {
@@ -704,7 +704,11 @@ async function refreshModels(ctx: RefreshModelsContext): Promise<ProviderModelCo
 
     const response = await fetch(`${KILO_GATEWAY_BASE}/models`, {
       headers,
-      signal: ctx.signal ?? AbortSignal.timeout(MODELS_FETCH_TIMEOUT_MS),
+      // ctx.signal is always present (pi >= 0.84.0), so combine it with our own timeout.
+      signal: AbortSignal.any([
+        ctx.signal,
+        AbortSignal.timeout(MODELS_FETCH_TIMEOUT_MS),
+      ]),
     });
 
     if (!response.ok) {
@@ -719,7 +723,9 @@ async function refreshModels(ctx: RefreshModelsContext): Promise<ProviderModelCo
     // Always cache the full catalog so auth state changes don't require a re-fetch.
     // Free models are tagged via x-kilo-free header; filter at return time only.
     const fullConfigs = buildModelConfigs(json.data);
-    await ctx.store.write({ models: fullConfigs as any, checkedAt: Date.now() });
+    await ctx.publish({
+      persist: { models: fullConfigs as any, checkedAt: Date.now() },
+    });
 
     return freeOnly ? filterFreeModels(fullConfigs) : fullConfigs;
   } catch (error) {
