@@ -537,6 +537,32 @@ function filterFreeModels(configs: ProviderModelConfig[]): ProviderModelConfig[]
 }
 
 // =============================================================================
+// Display Mode
+// =============================================================================
+
+/**
+ * The multi-line pricing suffix on model names is only useful in the
+ * interactive TUI model picker. Every other mode (print, json, rpc) exposes the
+ * raw name to callers, so those get the plain name instead.
+ *
+ * `ctx.mode` is only available inside event handlers, and the startup catalog
+ * restore runs before `session_start`, so seed from the terminal check (the TUI
+ * requires a TTY) and correct it in the `session_start` handler.
+ */
+let interactiveMode = process.stdout.isTTY === true;
+
+/** Strip the pricing suffix from model names unless the TUI will render it. */
+function forDisplayMode(models: ProviderModelConfig[]): ProviderModelConfig[] {
+  if (interactiveMode) return models;
+  return models.map((model) => {
+    const suffix = model.name.indexOf("\n");
+    return suffix === -1
+      ? model
+      : { ...model, name: model.name.slice(0, suffix) };
+  });
+}
+
+// =============================================================================
 // ToS Cache
 // =============================================================================
 
@@ -681,7 +707,7 @@ async function refreshModels(ctx: RefreshModelsContext): Promise<ProviderModelCo
   // Helper: cast and optionally filter cached models
   const fromCache = (): ProviderModelConfig[] => {
     const configs = [...cached!.models] as unknown as ProviderModelConfig[];
-    return freeOnly ? filterFreeModels(configs) : configs;
+    return forDisplayMode(freeOnly ? filterFreeModels(configs) : configs);
   };
 
   // Offline: return cached models if available
@@ -727,7 +753,7 @@ async function refreshModels(ctx: RefreshModelsContext): Promise<ProviderModelCo
       persist: { models: fullConfigs as any, checkedAt: Date.now() },
     });
 
-    return freeOnly ? filterFreeModels(fullConfigs) : fullConfigs;
+    return forDisplayMode(freeOnly ? filterFreeModels(fullConfigs) : fullConfigs);
   } catch (error) {
     // On network failure, fall back to cached models
     if (cached?.models.length) return fromCache();
@@ -749,6 +775,8 @@ export default function (pi: ExtensionAPI) {
   // Display credits when logged in and using a Kilo model.
   // Model catalog refresh is handled automatically by pi via refreshModels.
   pi.on("session_start", async (_event, ctx) => {
+    interactiveMode = ctx.mode === "tui";
+
     const cred = readStoredCredential("kilo");
 
     // Clear credits if not logged in or not using Kilo models
