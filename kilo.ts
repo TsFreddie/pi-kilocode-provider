@@ -537,6 +537,32 @@ function filterFreeModels(configs: ProviderModelConfig[]): ProviderModelConfig[]
 }
 
 // =============================================================================
+// Display Mode
+// =============================================================================
+
+/**
+ * The multi-line pricing suffix on model names is only useful in the
+ * interactive TUI model picker. Every other mode (print, json, rpc) exposes the
+ * raw name to callers, so those get the plain name instead.
+ *
+ * `ctx.mode` is only available inside event handlers, and the startup catalog
+ * restore runs before `session_start`, so seed from the terminal check (the TUI
+ * requires a TTY) and correct it in the `session_start` handler.
+ */
+let interactiveMode = process.stdout.isTTY === true;
+
+/** Strip the pricing suffix from model names unless the TUI will render it. */
+function forDisplayMode(models: ProviderModelConfig[]): ProviderModelConfig[] {
+  if (interactiveMode) return models;
+  return models.map((model) => {
+    const suffix = model.name.indexOf("\n");
+    return suffix === -1
+      ? model
+      : { ...model, name: model.name.slice(0, suffix) };
+  });
+}
+
+// =============================================================================
 // ToS Cache
 // =============================================================================
 
@@ -667,21 +693,21 @@ const KILO_OAUTH = {
 // =============================================================================
 
 /** pi calls this automatically to refresh the model catalog.
- *  Uses pi's built-in ProviderModelsStore for persistence (models-store.json)
- *  and provides the current OAuth credential, network status, and abort signal. */
+ *  pi owns the persistent catalog (models-store.json): it hands us a read-only
+ *  snapshot via `ctx.stored` and writes updates through `ctx.publish()`. */
 async function refreshModels(ctx: RefreshModelsContext): Promise<ProviderModelConfig[]> {
   // Show only free models when no credential, or when using the "free" placeholder key.
   // OAuth login or a real API key unlocks the full catalog.
   const isFreeKey = ctx.credential?.type === "api_key" && (ctx.credential as { key?: string }).key === "free";
   const freeOnly = !ctx.credential || isFreeKey;
 
-  // Check persistent store for cached models (managed by pi)
-  const cached = await ctx.store.read();
+  // Last persisted catalog, captured by pi before this refresh phase.
+  const cached = ctx.stored;
 
   // Helper: cast and optionally filter cached models
   const fromCache = (): ProviderModelConfig[] => {
     const configs = [...cached!.models] as unknown as ProviderModelConfig[];
-    return freeOnly ? filterFreeModels(configs) : configs;
+    return forDisplayMode(freeOnly ? filterFreeModels(configs) : configs);
   };
 
   // Offline: return cached models if available
@@ -704,7 +730,11 @@ async function refreshModels(ctx: RefreshModelsContext): Promise<ProviderModelCo
 
     const response = await fetch(`${KILO_GATEWAY_BASE}/models`, {
       headers,
-      signal: ctx.signal ?? AbortSignal.timeout(MODELS_FETCH_TIMEOUT_MS),
+      // ctx.signal is always present (pi >= 0.84.0), so combine it with our own timeout.
+      signal: AbortSignal.any([
+        ctx.signal,
+        AbortSignal.timeout(MODELS_FETCH_TIMEOUT_MS),
+      ]),
     });
 
     if (!response.ok) {
@@ -719,9 +749,11 @@ async function refreshModels(ctx: RefreshModelsContext): Promise<ProviderModelCo
     // Always cache the full catalog so auth state changes don't require a re-fetch.
     // Free models are tagged via x-kilo-free header; filter at return time only.
     const fullConfigs = buildModelConfigs(json.data);
-    await ctx.store.write({ models: fullConfigs as any, checkedAt: Date.now() });
+    await ctx.publish({
+      persist: { models: fullConfigs as any, checkedAt: Date.now() },
+    });
 
-    return freeOnly ? filterFreeModels(fullConfigs) : fullConfigs;
+    return forDisplayMode(freeOnly ? filterFreeModels(fullConfigs) : fullConfigs);
   } catch (error) {
     // On network failure, fall back to cached models
     if (cached?.models.length) return fromCache();
@@ -743,6 +775,8 @@ export default function (pi: ExtensionAPI) {
   // Display credits when logged in and using a Kilo model.
   // Model catalog refresh is handled automatically by pi via refreshModels.
   pi.on("session_start", async (_event, ctx) => {
+    interactiveMode = ctx.mode === "tui";
+
     const cred = readStoredCredential("kilo");
 
     // Clear credits if not logged in or not using Kilo models
